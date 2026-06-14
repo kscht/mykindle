@@ -1,161 +1,238 @@
-#!/usr/bin/env bash
-# kindle — подготовка книг/документов и заливка на Kindle (локально, по USB).
-#
-#   kindle convert [подпуть]   inbox -> staging (конвертация + впекание тегов)
-#   kindle push                staging -> Kindle /documents (нужен воткнутый Kindle)
-#   kindle status              что в inbox / staging / на устройстве
-#   kindle sync                convert + push
-#
-# Теги задаются файлами _kindle.md в папках inbox (см. README), каскадом по
-# вложенности. Формат вывода: KFX (богатое форматирование) с фолбэком на MOBI6;
-# PDF заливается как есть.
-set -euo pipefail
+#!/usr/bin/env python3
+"""kindle — подготовка книг/документов и заливка на Kindle (локально, по USB).
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-INBOX="$ROOT/inbox"
-STAGING="$ROOT/staging"
-STATE="$ROOT/.state"
-mkdir -p "$STAGING" "$STATE"
+  kindle convert [подстрока]   inbox -> staging (конвертация + впекание тегов)
+  kindle push                  staging -> Kindle /documents (нужен воткнутый Kindle)
+  kindle status                что в inbox / staging / на устройстве
+  kindle sync                  convert + push
+
+Теги задаются файлами _kindle.md в папках inbox (см. README), каскадом по
+вложенности. Формат вывода: KFX (богатое форматирование) с фолбэком на MOBI6;
+PDF заливается как есть. Зависимостей вне stdlib нет.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+INBOX = ROOT / "inbox"
+STAGING = ROOT / "staging"
+STATE = ROOT / ".state"
 
 # --- OS-специфика (macOS по умолчанию; переопределяется через env) ---
-CAL="${CALIBRE_BIN:-/Applications/calibre.app/Contents/MacOS}"
-EBOOK_CONVERT="$CAL/ebook-convert"
-EBOOK_META="$CAL/ebook-meta"
-MTP_CLI="${MTP_CLI:-/Applications/OpenMTP.app/Contents/Resources/bin/mtp-cli}"
-PROFILE="${KINDLE_PROFILE:-kindle_pw}"
-RICH="${KINDLE_RICH_FORMAT:-kfx}"          # формат богатого вывода: kfx | mobi
-KINDLE_DOCS="/documents"
+CAL = Path(os.environ.get("CALIBRE_BIN", "/Applications/calibre.app/Contents/MacOS"))
+EBOOK_CONVERT = str(CAL / "ebook-convert")
+EBOOK_META = str(CAL / "ebook-meta")
+MTP_CLI = os.environ.get("MTP_CLI", "/Applications/OpenMTP.app/Contents/Resources/bin/mtp-cli")
+PROFILE = os.environ.get("KINDLE_PROFILE", "kindle_pw")
+RICH = os.environ.get("KINDLE_RICH_FORMAT", "kfx")  # формат богатого вывода: kfx | mobi
+KINDLE_DOCS = "/documents"
 
-# форматы, которые конвертируем (остальное, кроме pdf, тоже пробуем)
-is_pdf()  { case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in *.pdf) return 0;; *) return 1;; esac; }
-is_meta() { [[ "$(basename "$1")" == "_kindle.md" ]]; }
-is_junk() { [[ "$(basename "$1")" == ".DS_Store" || "$(basename "$1")" == ".gitkeep" ]]; }
+SKIP_NAMES = {"_kindle.md", ".DS_Store", ".gitkeep"}
+EBOOK_EXTS = {".epub", ".fb2", ".mobi", ".azw3", ".azw", ".docx", ".doc",
+              ".txt", ".md", ".rtf", ".htmlz", ".html", ".lit", ".pdb"}
 
-# --- разбор _kindle.md одной папки: печатает теги (по одному в строке) ---
-parse_authors() { # $1 = путь к _kindle.md
-  sed -n 's/^add_authors:[[:space:]]*\[\(.*\)\].*/\1/p' "$1" | head -1 \
-    | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
-}
-parse_type() { # $1 = путь к _kindle.md
-  sed -n 's/^type:[[:space:]]*//p' "$1" | head -1 | sed 's/[[:space:]]*$//'
-}
 
-# --- каскад: для файла собрать теги (порядок: верхняя папка -> нижняя, дедуп)
-#     и тип (ближайшая папка побеждает). Пишет в глобальные TAGS[] и TYPE. ---
-collect_cascade() { # $1 = путь к контент-файлу
-  TAGS=(); TYPE="книга"
-  local dir; dir="$(dirname "$1")"
-  local rel="${dir#$INBOX}"; rel="${rel#/}"
-  local chain=("$INBOX") path="$INBOX"
-  if [ -n "$rel" ]; then
-    local IFS='/'; local parts=($rel); unset IFS
-    for p in "${parts[@]}"; do path="$path/$p"; chain+=("$path"); done
-  fi
-  local seen=" "
-  for d in "${chain[@]}"; do
-    local km="$d/_kindle.md"; [ -f "$km" ] || continue
-    while IFS= read -r t; do
-      [ -z "$t" ] && continue
-      case "$seen" in *" $t "*) ;; *) TAGS+=("$t"); seen="$seen$t ";; esac
-    done < <(parse_authors "$km")
-    local ty; ty="$(parse_type "$km")"; [ -n "$ty" ] && TYPE="$ty"
-  done
-}
+def run(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, encoding="utf-8", errors="replace", **kw)
 
-join_amp() { local s=""; for a in "$@"; do s="${s:+$s & }$a"; done; printf '%s' "$s"; }
 
-# --- собрать строку авторов для впекания ---
-build_authors() { # $1 = файл-источник; использует TAGS/TYPE
-  local tags_str; tags_str="$(join_amp "${TAGS[@]:-}")"
-  if [ "$TYPE" = "документ" ]; then
-    printf '%s' "$tags_str"
-  else
-    # книга: реальный автор из метаданных + теги
-    local orig; orig="$("$EBOOK_META" "$1" 2>/dev/null | sed -n 's/^Author(s)[[:space:]]*:[[:space:]]*//p' | head -1)"
-    orig="${orig%% [*}"   # отрезать "[sort]" если есть
-    [ -z "$orig" -o "$orig" = "Unknown" ] && orig=""
-    if [ -n "$orig" ] && [ -n "$tags_str" ]; then printf '%s & %s' "$orig" "$tags_str"
-    elif [ -n "$orig" ]; then printf '%s' "$orig"
-    else printf '%s' "$tags_str"; fi
-  fi
-}
+def strip_quotes(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
 
-stem_of() { # очистить имя от известных расширений
-  local b; b="$(basename "$1")"
-  for e in .epub .fb2 .mobi .azw3 .pdf .docx .doc .txt .md .azw; do b="${b%$e}"; done
-  printf '%s' "$b"
-}
 
-list_content() { find "$INBOX" -type f ! -name '.DS_Store' ! -name '.gitkeep' ! -name '_kindle.md' | sort; }
+def parse_kindle_md(path):
+    """Разобрать frontmatter _kindle.md в dict. Поддержка key: value,
+    key: [a, b, c] и блочных списков (- item). Без внешних зависимостей."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?", text, re.S)
+    block = m.group(1) if m else text
+    data = {}
+    cur_key = None
+    for line in block.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        mlist = re.match(r"\s*-\s+(.*)", line)
+        if mlist and cur_key is not None:
+            data.setdefault(cur_key, [])
+            if isinstance(data[cur_key], list):
+                data[cur_key].append(strip_quotes(mlist.group(1)))
+            continue
+        mkv = re.match(r"\s*([A-Za-z_]\w*)\s*:\s*(.*)", line)
+        if mkv:
+            key, val = mkv.group(1), mkv.group(2).strip()
+            cur_key = key
+            if val == "":
+                data[key] = []  # дальше может быть блочный список
+            elif val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1]
+                data[key] = [strip_quotes(x) for x in inner.split(",") if x.strip()]
+            else:
+                data[key] = strip_quotes(val)
+    return data
 
-# --- конвертация одного файла -> staging ---
-convert_one() {
-  local f="$1"
-  collect_cascade "$f"
-  local stem; stem="$(stem_of "$f")"
 
-  if is_pdf "$f"; then
-    # PDF оставляем как есть (теги для PDF — в имя файла)
-    local tag_prefix=""; [ "${#TAGS[@]}" -gt 0 ] && tag_prefix="[$(IFS=_; echo "${TAGS[*]}")] "
-    cp -f "$f" "$STAGING/${tag_prefix}${stem}.pdf"
-    echo "  PDF (как есть): ${tag_prefix}${stem}.pdf"
-    return 0
-  fi
+def collect_cascade(f):
+    """Для контент-файла собрать теги (верхняя папка -> нижняя, с дедупом,
+    сохраняя порядок) и тип (ближайшая папка побеждает)."""
+    tags, seen, typ = [], set(), "книга"
+    chain = [INBOX]
+    cur = INBOX
+    for part in f.parent.relative_to(INBOX).parts:
+        cur = cur / part
+        chain.append(cur)
+    for d in chain:
+        km = d / "_kindle.md"
+        if not km.is_file():
+            continue
+        data = parse_kindle_md(km)
+        for t in data.get("add_authors") or []:
+            if t and t not in seen:
+                seen.add(t)
+                tags.append(t)
+        if data.get("type"):
+            typ = data["type"]
+    return tags, typ
 
-  local authors; authors="$(build_authors "$f")"
-  local out_ext="$RICH" out="$STAGING/$stem.$RICH"
-  echo "  -> $stem.$RICH   авторы: $authors"
-  if "$EBOOK_CONVERT" "$f" "$out" --output-profile "$PROFILE" --authors "$authors" >/dev/null 2>"$STATE/last-convert.log"; then
-    return 0
-  fi
-  # фолбэк на mobi6
-  echo "     KFX не вышел -> фолбэк MOBI6 ($(tail -1 "$STATE/last-convert.log" 2>/dev/null))"
-  rm -f "$out"
-  out="$STAGING/$stem.mobi"
-  "$EBOOK_CONVERT" "$f" "$out" --output-profile "$PROFILE" --authors "$authors" --mobi-file-type old >/dev/null 2>&1
-}
 
-cmd_convert() {
-  local filter="${1:-}"
-  local n=0
-  while IFS= read -r f; do
-    [ -n "$filter" ] && [[ "$f" != *"$filter"* ]] && continue
-    echo "• ${f#$INBOX/}"
-    convert_one "$f" || echo "  !! ошибка конвертации"
-    n=$((n+1))
-  done < <(list_content)
-  echo "Готово: обработано $n файл(ов). staging: $(ls -1 "$STAGING" 2>/dev/null | grep -v '^\.gitkeep$' | wc -l | tr -d ' ')"
-}
+def orig_author(f):
+    out = run([EBOOK_META, str(f)]).stdout
+    for line in out.splitlines():
+        m = re.match(r"\s*Author\(s\)\s*:\s*(.*)", line)
+        if m:
+            a = re.sub(r"\s*\[.*\]$", "", m.group(1).strip())
+            return "" if a in ("", "Unknown") else a
+    return ""
 
-cmd_push() {
-  local files=(); while IFS= read -r f; do files+=("$f"); done \
-    < <(find "$STAGING" -type f ! -name '.gitkeep' | sort)
-  [ "${#files[@]}" -eq 0 ] && { echo "staging пуст — сначала kindle convert"; return 0; }
-  # проверка устройства
-  if ! printf 'ls /\n' | "$MTP_CLI" --batch 2>/dev/null | grep -q documents; then
-    echo "Kindle не найден. Воткни устройство кабелем и закрой GUI OpenMTP."; return 1
-  fi
-  local batch=""; for f in "${files[@]}"; do batch+="put $f $KINDLE_DOCS"$'\n'; done
-  printf '%s' "$batch" | "$MTP_CLI" --batch
-  printf '%s\n' "${files[@]##*/}" >> "$STATE/uploaded.list"
-  echo "Залито: ${#files[@]} файл(ов) в $KINDLE_DOCS"
-}
 
-cmd_status() {
-  echo "inbox:   $(list_content | wc -l | tr -d ' ') файл(ов)"
-  echo "staging: $(find "$STAGING" -type f ! -name '.gitkeep' | wc -l | tr -d ' ') готово к заливке"
-  echo "залито (история): $(sort -u "$STATE/uploaded.list" 2>/dev/null | wc -l | tr -d ' ')"
-  if printf 'ls /documents\n' | "$MTP_CLI" --batch 2>/dev/null | grep -q .; then
-    echo "Kindle: подключён"
-  else
-    echo "Kindle: не подключён"
-  fi
-}
+def build_authors(f, tags, typ):
+    tags_str = " & ".join(tags)
+    if typ == "документ":
+        return tags_str
+    parts = [p for p in (orig_author(f), tags_str) if p]
+    return " & ".join(parts)
 
-case "${1:-}" in
-  convert) shift; cmd_convert "${1:-}";;
-  push)    cmd_push;;
-  status)  cmd_status;;
-  sync)    cmd_convert ""; cmd_push;;
-  *) echo "usage: kindle {convert [подпуть]|push|status|sync}"; exit 1;;
-esac
+
+def clean_stem(f):
+    name = f.name
+    for ext in sorted(EBOOK_EXTS | {".pdf"}, key=len, reverse=True):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+    return name
+
+
+def list_content():
+    return sorted(p for p in INBOX.rglob("*")
+                  if p.is_file() and p.name not in SKIP_NAMES)
+
+
+def convert_one(f):
+    tags, typ = collect_cascade(f)
+    stem = clean_stem(f)
+    ext = f.suffix.lower()
+
+    if ext == ".pdf":
+        prefix = ("[" + "_".join(tags) + "] ") if tags else ""
+        dst = STAGING / (prefix + stem + ".pdf")
+        shutil.copyfile(f, dst)
+        print(f"  PDF (как есть): {dst.name}")
+        return True
+
+    authors = build_authors(f, tags, typ)
+    out = STAGING / f"{stem}.{RICH}"
+    print(f"  -> {out.name}   авторы: {authors}")
+    r = run([EBOOK_CONVERT, str(f), str(out),
+             "--output-profile", PROFILE, "--authors", authors])
+    if r.returncode == 0 and out.exists():
+        return True
+
+    last = (r.stderr or r.stdout).strip().splitlines()
+    print(f"     {RICH} не вышел -> фолбэк MOBI6 ({last[-1] if last else 'ошибка'})")
+    if out.exists():
+        out.unlink()
+    out = STAGING / f"{stem}.mobi"
+    r = run([EBOOK_CONVERT, str(f), str(out), "--output-profile", PROFILE,
+             "--authors", authors, "--mobi-file-type", "old"])
+    return r.returncode == 0 and out.exists()
+
+
+def kindle_connected():
+    r = run([MTP_CLI, "--batch"], input="ls /\n")
+    return "documents" in r.stdout
+
+
+def cmd_convert(flt=""):
+    STAGING.mkdir(exist_ok=True)
+    STATE.mkdir(exist_ok=True)
+    n = ok = 0
+    for f in list_content():
+        rel = f.relative_to(INBOX)
+        if flt and flt not in str(rel):
+            continue
+        print(f"• {rel}")
+        n += 1
+        try:
+            if convert_one(f):
+                ok += 1
+            else:
+                print("  !! не сконвертировалось")
+        except Exception as e:
+            print(f"  !! ошибка: {e}")
+    staged = len([p for p in STAGING.iterdir() if p.name != ".gitkeep"])
+    print(f"Готово: {ok}/{n} сконвертировано. В staging: {staged}")
+
+
+def cmd_push():
+    files = sorted(p for p in STAGING.iterdir()
+                   if p.is_file() and p.name != ".gitkeep")
+    if not files:
+        print("staging пуст — сначала: kindle convert")
+        return
+    if not kindle_connected():
+        print("Kindle не найден. Воткни кабель и закрой GUI OpenMTP.")
+        sys.exit(1)
+    batch = "".join(f"put {f} {KINDLE_DOCS}\n" for f in files)
+    r = run([MTP_CLI, "--batch"], input=batch)
+    print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "")
+    with (STATE / "uploaded.list").open("a", encoding="utf-8") as fh:
+        for f in files:
+            fh.write(f.name + "\n")
+    print(f"Залито: {len(files)} файл(ов) в {KINDLE_DOCS}")
+
+
+def cmd_status():
+    inbox_n = len(list_content())
+    staged = len([p for p in STAGING.iterdir() if p.name != ".gitkeep"]) if STAGING.exists() else 0
+    hist = STATE / "uploaded.list"
+    uploaded = len(set(hist.read_text(encoding="utf-8").split())) if hist.exists() else 0
+    print(f"inbox:   {inbox_n} файл(ов)")
+    print(f"staging: {staged} готово к заливке")
+    print(f"залито (история): {uploaded}")
+    print(f"Kindle: {'подключён' if kindle_connected() else 'не подключён'}")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "convert":
+        cmd_convert(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd == "push":
+        cmd_push()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "sync":
+        cmd_convert("")
+        cmd_push()
+    else:
+        print("usage: kindle {convert [подстрока]|push|status|sync}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
