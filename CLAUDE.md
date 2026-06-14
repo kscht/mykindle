@@ -17,12 +17,24 @@
 
 ```
 inbox/ (файлы по папкам + _kindle.md)
-  → конвертация в .azw3 (Calibre ebook-convert)
+  → конвертация в .mobi (Calibre ebook-convert --output-profile kindle_pw)
   → теги в метаданные копии (ebook-meta --authors)
   → staging/
   → заливка на Kindle (mtp-cli put → /documents)   [нужен воткнутый Kindle]
   → .state/ (что уже залито — для sync)
 ```
+
+### Выходной формат: MOBI (проверено на устройстве)
+
+Сайдлоад через `/documents` тестировался на живом Kindle:
+- **MOBI** — ✅ читается. **Это выходной формат по умолчанию.**
+- **AZW3** — ❌ чёрный/пустой экран при открытии (баг прошивки на сайдлоаде; ASIN
+  ни при чём — MOBI тоже с ASIN, но открывается).
+- **EPUB** — ❌ не распознаётся при сайдлоаде в `/documents`.
+
+`ebook-convert <in> out.mobi --output-profile kindle_pw` (дефолтный MOBI6 рендерится
+лучше всего для документов). Формат держать **конфигурируемым** (ради переносимости
+на другие устройства/прошивки), но дефолт — MOBI.
 
 ## Формат `_kindle.md` (для реализации парсера)
 
@@ -64,8 +76,12 @@ CLAUDE.md                 этот файл
 ## Состояние
 
 - [x] Структура, формат `_kindle.md`, документация.
-- [ ] Markdown-контент (GFM: таблицы/картинки) → Kindle. Вероятно Quarto/pandoc. Позже.
+- [x] **End-to-end проверено на живом Kindle**: md→mobi (ebook-convert) → теги в
+      авторов (ebook-meta) → заливка (mtp-cli put → /documents), round-trip md5 OK.
+      Поиск на Kindle по тегу-автору работает. Выходной формат = **MOBI** (см. выше).
+- [ ] Markdown-контент (GFM: таблицы/картинки) → Kindle. Таблицы сейчас «сплющиваются».
+      Вероятно Quarto/pandoc. Позже.
 - [ ] `bin/`: парсер `_kindle.md` + конвертер (ebook-convert + ebook-meta).
 - [ ] CLI-интерфейс (`status` / `convert` / `push`) — обсуждается.
-- [ ] Заливка `mtp-cli` + sync через `.state/`. End-to-end не тестирован (нужен Kindle).
+- [ ] Sync через `.state/` (что уже залито).
 - [ ] Абстракция OS-специфики (пути Calibre, MTP-бэкенд) для переносимости.
