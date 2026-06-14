@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# kindle — подготовка книг/документов и заливка на Kindle (локально, по USB).
+#
+#   kindle convert [подпуть]   inbox -> staging (конвертация + впекание тегов)
+#   kindle push                staging -> Kindle /documents (нужен воткнутый Kindle)
+#   kindle status              что в inbox / staging / на устройстве
+#   kindle sync                convert + push
+#
+# Теги задаются файлами _kindle.md в папках inbox (см. README), каскадом по
+# вложенности. Формат вывода: KFX (богатое форматирование) с фолбэком на MOBI6;
+# PDF заливается как есть.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+INBOX="$ROOT/inbox"
+STAGING="$ROOT/staging"
+STATE="$ROOT/.state"
+mkdir -p "$STAGING" "$STATE"
+
+# --- OS-специфика (macOS по умолчанию; переопределяется через env) ---
+CAL="${CALIBRE_BIN:-/Applications/calibre.app/Contents/MacOS}"
+EBOOK_CONVERT="$CAL/ebook-convert"
+EBOOK_META="$CAL/ebook-meta"
+MTP_CLI="${MTP_CLI:-/Applications/OpenMTP.app/Contents/Resources/bin/mtp-cli}"
+PROFILE="${KINDLE_PROFILE:-kindle_pw}"
+RICH="${KINDLE_RICH_FORMAT:-kfx}"          # формат богатого вывода: kfx | mobi
+KINDLE_DOCS="/documents"
+
+# форматы, которые конвертируем (остальное, кроме pdf, тоже пробуем)
+is_pdf()  { [[ "${1,,}" == *.pdf ]]; }
+is_meta() { [[ "$(basename "$1")" == "_kindle.md" ]]; }
+is_junk() { [[ "$(basename "$1")" == ".DS_Store" || "$(basename "$1")" == ".gitkeep" ]]; }
+
+# --- разбор _kindle.md одной папки: печатает теги (по одному в строке) ---
+parse_authors() { # $1 = путь к _kindle.md
+  sed -n 's/^add_authors:[[:space:]]*\[\(.*\)\].*/\1/p' "$1" | head -1 \
+    | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
+}
+parse_type() { # $1 = путь к _kindle.md
+  sed -n 's/^type:[[:space:]]*//p' "$1" | head -1 | sed 's/[[:space:]]*$//'
+}
+
+# --- каскад: для файла собрать теги (порядок: верхняя папка -> нижняя, дедуп)
+#     и тип (ближайшая папка побеждает). Пишет в глобальные TAGS[] и TYPE. ---
+collect_cascade() { # $1 = путь к контент-файлу
+  TAGS=(); TYPE="книга"
+  local dir; dir="$(dirname "$1")"
+  local rel="${dir#$INBOX}"; rel="${rel#/}"
+  local chain=("$INBOX") path="$INBOX"
+  if [ -n "$rel" ]; then
+    local IFS='/'; local parts=($rel); unset IFS
+    for p in "${parts[@]}"; do path="$path/$p"; chain+=("$path"); done
+  fi
+  local seen=" "
+  for d in "${chain[@]}"; do
+    local km="$d/_kindle.md"; [ -f "$km" ] || continue
+    while IFS= read -r t; do
+      [ -z "$t" ] && continue
+      case "$seen" in *" $t "*) ;; *) TAGS+=("$t"); seen="$seen$t ";; esac
+    done < <(parse_authors "$km")
+    local ty; ty="$(parse_type "$km")"; [ -n "$ty" ] && TYPE="$ty"
+  done
+}
+
+join_amp() { local s=""; for a in "$@"; do s="${s:+$s & }$a"; done; printf '%s' "$s"; }
+
+# --- собрать строку авторов для впекания ---
+build_authors() { # $1 = файл-источник; использует TAGS/TYPE
+  local tags_str; tags_str="$(join_amp "${TAGS[@]:-}")"
+  if [ "$TYPE" = "документ" ]; then
+    printf '%s' "$tags_str"
+  else
+    # книга: реальный автор из метаданных + теги
+    local orig; orig="$("$EBOOK_META" "$1" 2>/dev/null | sed -n 's/^Author(s)[[:space:]]*:[[:space:]]*//p' | head -1)"
+    orig="${orig%% [*}"   # отрезать "[sort]" если есть
+    [ -z "$orig" -o "$orig" = "Unknown" ] && orig=""
+    if [ -n "$orig" ] && [ -n "$tags_str" ]; then printf '%s & %s' "$orig" "$tags_str"
+    elif [ -n "$orig" ]; then printf '%s' "$orig"
+    else printf '%s' "$tags_str"; fi
+  fi
+}
+
+stem_of() { # очистить имя от известных расширений
+  local b; b="$(basename "$1")"
+  for e in .epub .fb2 .mobi .azw3 .pdf .docx .doc .txt .md .azw; do b="${b%$e}"; done
+  printf '%s' "$b"
+}
+
+list_content() { find "$INBOX" -type f ! -name '.DS_Store' ! -name '.gitkeep' ! -name '_kindle.md' | sort; }
+
+# --- конвертация одного файла -> staging ---
+convert_one() {
+  local f="$1"
+  collect_cascade "$f"
+  local stem; stem="$(stem_of "$f")"
+
+  if is_pdf "$f"; then
+    # PDF оставляем как есть (теги для PDF — в имя файла)
+    local tag_prefix=""; [ "${#TAGS[@]}" -gt 0 ] && tag_prefix="[$(IFS=_; echo "${TAGS[*]}")] "
+    cp -f "$f" "$STAGING/${tag_prefix}${stem}.pdf"
+    echo "  PDF (как есть): ${tag_prefix}${stem}.pdf"
+    return 0
+  fi
+
+  local authors; authors="$(build_authors "$f")"
+  local out_ext="$RICH" out="$STAGING/$stem.$RICH"
+  echo "  -> $stem.$RICH   авторы: $authors"
+  if "$EBOOK_CONVERT" "$f" "$out" --output-profile "$PROFILE" --authors "$authors" >/dev/null 2>"$STATE/last-convert.log"; then
+    return 0
+  fi
+  # фолбэк на mobi6
+  echo "     KFX не вышел -> фолбэк MOBI6 ($(tail -1 "$STATE/last-convert.log" 2>/dev/null))"
+  rm -f "$out"
+  out="$STAGING/$stem.mobi"
+  "$EBOOK_CONVERT" "$f" "$out" --output-profile "$PROFILE" --authors "$authors" --mobi-file-type old >/dev/null 2>&1
+}
+
+cmd_convert() {
+  local filter="${1:-}"
+  local n=0
+  while IFS= read -r f; do
+    [ -n "$filter" ] && [[ "$f" != *"$filter"* ]] && continue
+    echo "• ${f#$INBOX/}"
+    convert_one "$f" || echo "  !! ошибка конвертации"
+    n=$((n+1))
+  done < <(list_content)
+  echo "Готово: обработано $n файл(ов). staging: $(ls -1 "$STAGING" 2>/dev/null | grep -v '^\.gitkeep$' | wc -l | tr -d ' ')"
+}
+
+cmd_push() {
+  local files=(); while IFS= read -r f; do files+=("$f"); done \
+    < <(find "$STAGING" -type f ! -name '.gitkeep' | sort)
+  [ "${#files[@]}" -eq 0 ] && { echo "staging пуст — сначала kindle convert"; return 0; }
+  # проверка устройства
+  if ! printf 'ls /\n' | "$MTP_CLI" --batch 2>/dev/null | grep -q documents; then
+    echo "Kindle не найден. Воткни устройство кабелем и закрой GUI OpenMTP."; return 1
+  fi
+  local batch=""; for f in "${files[@]}"; do batch+="put $f $KINDLE_DOCS"$'\n'; done
+  printf '%s' "$batch" | "$MTP_CLI" --batch
+  printf '%s\n' "${files[@]##*/}" >> "$STATE/uploaded.list"
+  echo "Залито: ${#files[@]} файл(ов) в $KINDLE_DOCS"
+}
+
+cmd_status() {
+  echo "inbox:   $(list_content | wc -l | tr -d ' ') файл(ов)"
+  echo "staging: $(find "$STAGING" -type f ! -name '.gitkeep' | wc -l | tr -d ' ') готово к заливке"
+  echo "залито (история): $(sort -u "$STATE/uploaded.list" 2>/dev/null | wc -l | tr -d ' ')"
+  if printf 'ls /documents\n' | "$MTP_CLI" --batch 2>/dev/null | grep -q .; then
+    echo "Kindle: подключён"
+  else
+    echo "Kindle: не подключён"
+  fi
+}
+
+case "${1:-}" in
+  convert) shift; cmd_convert "${1:-}";;
+  push)    cmd_push;;
+  status)  cmd_status;;
+  sync)    cmd_convert ""; cmd_push;;
+  *) echo "usage: kindle {convert [подпуть]|push|status|sync}"; exit 1;;
+esac
