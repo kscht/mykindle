@@ -29,8 +29,11 @@ git pull
 
 Требуется на машине:
 - [Calibre](https://calibre-ebook.com/) (CLI: `ebook-convert`, `ebook-meta`, `calibredb`);
-- на macOS — `mtp-cli` (есть внутри [OpenMTP](https://github.com/ganeshrvel/openmtp));
-  на Linux — `libmtp` (`mtp-sendfile`).
+- для заливки на macOS — `mtp-cli` (внутри [OpenMTP](https://github.com/ganeshrvel/openmtp));
+  на Linux — `libmtp` (`mtp-sendfile`);
+- для богатого форматирования (KFX) — Kindle Previewer + KFX-плагины Calibre.
+
+📦 **Установка на чистый Mac пошагово — [`docs/setup-macos.md`](docs/setup-macos.md).**
 
 ## Как пользоваться
 
