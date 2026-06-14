@@ -72,6 +72,20 @@ cd ~/mykindle
 ```
 Обновляться потом — `git pull`.
 
+Сам инструмент `bin/kindle` — на **Python 3** (без сторонних зависимостей).
+На macOS python3 обычно уже есть (Command Line Tools); если нет — `xcode-select
+--install` или `brew install python`.
+
+## 8. Первый запуск
+
+```bash
+cd ~/mykindle
+./bin/kindle status            # проверка: inbox / staging / Kindle
+./bin/kindle convert --jobs 6  # inbox → staging (KFX, параллельно)
+./bin/kindle push              # staging → Kindle (воткни устройство)
+```
+Подробно про команды и теги — в [`../README.md`](../README.md).
+
 ## Пути к инструментам (PATH в неинтерактивной сессии их не подхватывает)
 
 | Инструмент | Путь |
