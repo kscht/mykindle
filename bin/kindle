@@ -148,9 +148,14 @@ def convert_one(f):
         return True, f"PDF как есть -> {dst.name}"
 
     authors = build_authors(f, tags, typ)
+    # По умолчанию выкидываем встроенные шрифты: в книгах часто лежат неполные
+    # subset-шрифты (нет части кириллицы/латиницы/жирного) -> «квадратики» (tofu)
+    # на Kindle. Без них устройство берёт свои полные шрифты. KINDLE_KEEP_FONTS=1
+    # чтобы сохранить встроенные.
+    extra = [] if os.environ.get("KINDLE_KEEP_FONTS") else ["--filter-css", "font-family,font"]
     out = STAGING / f"{stem}.{RICH}"
     r = run([EBOOK_CONVERT, str(f), str(out),
-             "--output-profile", PROFILE, "--authors", authors])
+             "--output-profile", PROFILE, "--authors", authors] + extra)
     if r.returncode == 0 and out.exists():
         return True, f"{out.name}  [{authors}]"
 
@@ -158,7 +163,7 @@ def convert_one(f):
         out.unlink()
     out = STAGING / f"{stem}.mobi"
     r2 = run([EBOOK_CONVERT, str(f), str(out), "--output-profile", PROFILE,
-              "--authors", authors, "--mobi-file-type", "old"])
+              "--authors", authors, "--mobi-file-type", "old"] + extra)
     if r2.returncode == 0 and out.exists():
         return True, f"{out.name} (MOBI6 фолбэк)  [{authors}]"
     last = (r.stderr or r.stdout).strip().splitlines()
