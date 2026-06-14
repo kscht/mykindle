@@ -203,7 +203,7 @@ def cmd_push():
     if not kindle_connected():
         print("Kindle не найден. Воткни кабель и закрой GUI OpenMTP.")
         sys.exit(1)
-    batch = "".join(f"put {f} {KINDLE_DOCS}\n" for f in files)
+    batch = "".join(f'put "{f}" "{KINDLE_DOCS}"\n' for f in files)
     r = run([MTP_CLI, "--batch"], input=batch)
     print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "")
     with (STATE / "uploaded.list").open("a", encoding="utf-8") as fh:
