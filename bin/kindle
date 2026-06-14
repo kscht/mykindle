@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -134,6 +135,8 @@ def list_content():
 
 
 def convert_one(f):
+    """Конвертировать один файл -> staging. Возвращает (ok, сообщение).
+    Без печати — для безопасного параллельного запуска."""
     tags, typ = collect_cascade(f)
     stem = clean_stem(f)
     ext = f.suffix.lower()
@@ -142,25 +145,24 @@ def convert_one(f):
         prefix = ("[" + "_".join(tags) + "] ") if tags else ""
         dst = STAGING / (prefix + stem + ".pdf")
         shutil.copyfile(f, dst)
-        print(f"  PDF (как есть): {dst.name}")
-        return True
+        return True, f"PDF как есть -> {dst.name}"
 
     authors = build_authors(f, tags, typ)
     out = STAGING / f"{stem}.{RICH}"
-    print(f"  -> {out.name}   авторы: {authors}")
     r = run([EBOOK_CONVERT, str(f), str(out),
              "--output-profile", PROFILE, "--authors", authors])
     if r.returncode == 0 and out.exists():
-        return True
+        return True, f"{out.name}  [{authors}]"
 
-    last = (r.stderr or r.stdout).strip().splitlines()
-    print(f"     {RICH} не вышел -> фолбэк MOBI6 ({last[-1] if last else 'ошибка'})")
     if out.exists():
         out.unlink()
     out = STAGING / f"{stem}.mobi"
-    r = run([EBOOK_CONVERT, str(f), str(out), "--output-profile", PROFILE,
-             "--authors", authors, "--mobi-file-type", "old"])
-    return r.returncode == 0 and out.exists()
+    r2 = run([EBOOK_CONVERT, str(f), str(out), "--output-profile", PROFILE,
+              "--authors", authors, "--mobi-file-type", "old"])
+    if r2.returncode == 0 and out.exists():
+        return True, f"{out.name} (MOBI6 фолбэк)  [{authors}]"
+    last = (r.stderr or r.stdout).strip().splitlines()
+    return False, f"ОШИБКА KFX и MOBI: {last[-1] if last else '?'}"
 
 
 def kindle_connected():
@@ -168,25 +170,28 @@ def kindle_connected():
     return "documents" in r.stdout
 
 
-def cmd_convert(flt=""):
+def cmd_convert(flt="", jobs=None):
     STAGING.mkdir(exist_ok=True)
     STATE.mkdir(exist_ok=True)
-    n = ok = 0
-    for f in list_content():
-        rel = f.relative_to(INBOX)
-        if flt and flt not in str(rel):
-            continue
-        print(f"• {rel}")
-        n += 1
-        try:
-            if convert_one(f):
-                ok += 1
-            else:
-                print("  !! не сконвертировалось")
-        except Exception as e:
-            print(f"  !! ошибка: {e}")
-    staged = len([p for p in STAGING.iterdir() if p.name != ".gitkeep"])
-    print(f"Готово: {ok}/{n} сконвертировано. В staging: {staged}")
+    jobs = jobs or int(os.environ.get("KINDLE_JOBS", "4"))
+    files = [f for f in list_content() if not flt or flt in str(f.relative_to(INBOX))]
+    if not files:
+        print("Нет файлов по фильтру.")
+        return
+    print(f"Конвертирую {len(files)} файл(ов), параллельно: {jobs}")
+    total, done, ok = len(files), 0, 0
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = {ex.submit(convert_one, f): f for f in files}
+        for fut in as_completed(futs):
+            name = futs[fut].name
+            try:
+                good, msg = fut.result()
+            except Exception as e:
+                good, msg = False, f"исключение: {e}"
+            done += 1
+            ok += 1 if good else 0
+            print(f"  [{done}/{total}] {'✓' if good else '✗'} {name}: {msg}", flush=True)
+    print(f"Готово: {ok}/{total} сконвертировано.")
 
 
 def cmd_push():
@@ -219,18 +224,24 @@ def cmd_status():
 
 
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    args = sys.argv[1:]
+    jobs = None
+    if "--jobs" in args:
+        i = args.index("--jobs")
+        jobs = int(args[i + 1])
+        del args[i:i + 2]
+    cmd = args[0] if args else ""
     if cmd == "convert":
-        cmd_convert(sys.argv[2] if len(sys.argv) > 2 else "")
+        cmd_convert(args[1] if len(args) > 1 else "", jobs)
     elif cmd == "push":
         cmd_push()
     elif cmd == "status":
         cmd_status()
     elif cmd == "sync":
-        cmd_convert("")
+        cmd_convert("", jobs)
         cmd_push()
     else:
-        print("usage: kindle {convert [подстрока]|push|status|sync}")
+        print("usage: kindle {convert [подстрока] [--jobs N]|push|status|sync}")
         sys.exit(1)
 
 
